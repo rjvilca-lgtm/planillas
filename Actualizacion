@@ -1,6 +1,6 @@
 Sub ActualizarCodigoDesdeTXT()
     
    
-    MsgBox "código actualizado", vbInformation
+    MsgBox "actualización 02/10", vbInformation
 
 End Sub
