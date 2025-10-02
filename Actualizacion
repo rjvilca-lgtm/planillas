@@ -1,5 +1,5 @@
 Sub Actualizacion()
     
-    MsgBox "actualización 06/10", vbInformation
+    MsgBox "Actualización no disponible", vbInformation
 
 End Sub
