@@ -1,0 +1,46 @@
+Sub ActualizarCodigoDesdeURL()
+    Dim vbProj As Object
+    Dim vbComp As Object
+    Dim vbCodeMod As Object
+    Dim LineCount As Long
+    Dim Codigo As String
+    Dim http As Object
+    Dim Stream As Object
+    
+    ' Descargar archivo desde GitHub RAW
+    Set http = CreateObject("MSXML2.XMLHTTP")
+    http.Open "GET", "https://raw.githubusercontent.com/rjvilca-lgtm/planillas/refs/heads/main/Actualizacion", False
+    http.Send
+    
+    If http.Status <> 200 Then
+        MsgBox "Error al descargar el archivo. Código: " & http.Status, vbCritical
+        Exit Sub
+    End If
+    
+    ' Leer contenido directamente en UTF-8 (evita BOM y errores de acentos)
+    Set Stream = CreateObject("ADODB.Stream")
+    Stream.Type = 1 ' binary
+    Stream.Open
+    Stream.Write http.responseBody
+    Stream.Position = 0
+    Stream.Type = 2 ' text
+    Stream.Charset = "utf-8"
+    Codigo = Stream.ReadText
+    Stream.Close
+    Set Stream = Nothing
+    
+    ' Acceder al módulo en este workbook
+    Set vbProj = ThisWorkbook.VBProject
+    Set vbComp = vbProj.VBComponents("Módulo5") ' <--- cámbialo según tu módulo
+    Set vbCodeMod = vbComp.CodeModule
+    
+    ' Borrar el código existente
+    LineCount = vbCodeMod.CountOfLines
+    If LineCount > 0 Then vbCodeMod.DeleteLines 1, LineCount
+    
+    ' Insertar nuevo código desde el TXT descargado
+    vbCodeMod.AddFromString Codigo
+    
+    MsgBox "El módulo se actualizó correctamente desde GitHub RAW.", vbInformation
+End Sub
+
