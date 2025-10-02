@@ -1,0 +1,6 @@
+Sub ActualizarCodigoDesdeTXT()
+    
+   
+    MsgBox "código actualizado", vbInformation
+
+End Sub
