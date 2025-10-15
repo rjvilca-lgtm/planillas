@@ -1,5 +1,967 @@
 Sub Actualizacion()
+
+Call Subir_Datos_Entrada_MultiBloque_Diagnostico
+Call Subir_Datos_Entrada_PlanTCI
+Call Subir_Datos_Entrada_PlanTCII
+Call Subir_Horas_Adicionales_Extendido
+Call SubirDatos_Postgrado
+Call CargarDatos_Investigacion
+Call CargarDatos_Ayudantias
+End Sub
+
+
+Sub Subir_Datos_Entrada_MultiBloque_Diagnostico()
+
+    On Error GoTo ManejoErroresGlobal
     
-    MsgBox "Actualización no disponible", vbInformation
+    Dim conn As Object
+    Dim connStr As String
+    Dim ws As Worksheet
+    Dim registrosSubidos As Long
+    Dim hojaOrigen As String, origen As String
+
+    ' === CONFIGURACIÓN ===
+    Set ws = ThisWorkbook.Sheets("Plan TC Transversales")
+    hojaOrigen = "Plan TC Transversales"
+    origen = Trim(ws.Range("A2").value)
+    
+    connStr = "Provider=SQLOLEDB;Data Source=ucsp.database.windows.net;" & _
+              "Initial Catalog=saldos;User ID=robert;Password=)358£CvM,4'l;"
+    
+    registrosSubidos = 0
+
+    ' Conectar
+    Set conn = CreateObject("ADODB.Connection")
+    conn.Open connStr
+
+    ' === BORRAR DATOS ANTERIORES ===
+    On Error Resume Next
+    conn.Execute "DELETE FROM DATOS_ENTRADA WHERE HOJA_ORIGEN = '" & Replace(hojaOrigen, "'", "''") & _
+                 "' AND ORIGEN = '" & Replace(origen, "'", "''") & "'"
+    If Err.Number <> 0 Then
+        MsgBox "Error al borrar datos anteriores: " & Err.Description, vbCritical
+        conn.Close
+        Set conn = Nothing
+        Exit Sub
+    End If
+    On Error GoTo 0
+
+    ws.Range("A84").ClearContents
+
+    ' === BLOQUE 1: columnas G a BH (mes = 3) ===
+    Call ProcesarBloque(ws, conn, 7, ws.Columns("BH").Column, 3, hojaOrigen, origen, registrosSubidos)
+    
+    ' === BLOQUE 2: columnas GH a II (mes = 8) ===
+    Call ProcesarBloque(ws, conn, ws.Columns("GH").Column, ws.Columns("II").Column, 8, hojaOrigen, origen, registrosSubidos)
+    
+    ' cerrar
+    conn.Close
+    Set conn = Nothing
+    Application.StatusBar = False
+    MsgBox "Datos subidos correctamente. Total registros procesados: " & registrosSubidos, vbInformation
+    Exit Sub
+
+ManejoErroresGlobal:
+    Application.StatusBar = False
+    If Not conn Is Nothing Then
+        If conn.State = 1 Then conn.Close
+    End If
+    Set conn = Nothing
+    MsgBox "Error inesperado: " & Err.Number & " - " & Err.Description, vbCritical
+
+End Sub
+
+
+' ============================================================
+' SUBRUTINA PARA PROCESAR BLOQUES DE COLUMNAS
+' ============================================================
+Private Sub ProcesarBloque(ws As Worksheet, conn As Object, colInicio As Long, colFin As Long, mes As Long, hojaOrigen As String, origen As String, ByRef registrosSubidos As Long)
+    Dim i As Long, c As Long
+    Dim lastRow As Long
+    Dim dni As String, nombre As String
+    Dim horas As Double
+    Dim centroCosto As String, concepto As String
+    Dim batchSQL As String
+    Dim batchCount As Long
+    Dim sqlSingle As String
+    Dim arrInserts() As String
+    Dim idx As Long
+    Dim batchSize As Long
+    
+    batchSize = 200
+    lastRow = ws.Cells(ws.Rows.Count, "A").End(xlUp).Row
+
+    For c = colInicio To colFin
+        centroCosto = Trim(ws.Cells(3, c).value)
+        concepto = Trim(ws.Cells(4, c).value)
+        
+        If centroCosto <> "" And concepto <> "" Then
+            batchSQL = ""
+            batchCount = 0
+            ReDim arrInserts(1 To 1)
+            idx = 0
+
+            For i = 5 To lastRow
+                dni = Trim(ws.Cells(i, "A").value)
+                nombre = Replace(Trim(ws.Cells(i, "B").value), "'", "''")
+                
+                If dni <> "" Then
+                    ' convertir hora a decimal
+                    If IsEmpty(ws.Cells(i, c).value) Or ws.Cells(i, c).value = "" Then
+                        horas = 0
+                    Else
+                        On Error Resume Next
+                        horas = Round(CDbl(ws.Cells(i, c).value) * 24, 2)
+                        If Err.Number <> 0 Then
+                            horas = 0
+                            Err.Clear
+                        End If
+                        On Error GoTo 0
+                    End If
+                    
+                    ' <<< solo subir si horas > 0
+                    If horas > 0 Then
+                        sqlSingle = "('" & Replace(dni, "'", "''") & "', '" & Replace(nombre, "'", "''") & "', '" & _
+                                    Replace(centroCosto, "'", "''") & "', '" & Replace(concepto, "'", "''") & "', " & _
+                                    Replace(CStr(horas), ",", ".") & ", 0, " & mes & ", '" & Replace(hojaOrigen, "'", "''") & _
+                                    "', '" & Replace(origen, "'", "''") & "')"
+                        
+                        ' Acumular batch
+                        If batchCount = 0 Then
+                            batchSQL = "INSERT INTO DATOS_ENTRADA (DNI, NOMBRE, CENTRO_COSTO, CONCEPTO, HORAS, IMPORTE, MES, HOJA_ORIGEN, ORIGEN) VALUES " & sqlSingle
+                        Else
+                            batchSQL = batchSQL & ", " & sqlSingle
+                        End If
+                        
+                        idx = idx + 1
+                        ReDim Preserve arrInserts(1 To idx)
+                        arrInserts(idx) = "INSERT INTO DATOS_ENTRADA (DNI, NOMBRE, CENTRO_COSTO, CONCEPTO, HORAS, IMPORTE, MES, HOJA_ORIGEN, ORIGEN) VALUES " & sqlSingle
+                        
+                        batchCount = batchCount + 1
+                        registrosSubidos = registrosSubidos + 1
+                        
+                        ' ejecutar batch
+                        If batchCount = batchSize Then
+                            On Error Resume Next
+                            conn.Execute batchSQL
+                            If Err.Number <> 0 Then
+                                Err.Clear
+                                Call EscribirSentenciaFallidaPorElementos(conn, arrInserts, ws, c)
+                                conn.Close
+                                Set conn = Nothing
+                                Exit Sub
+                            End If
+                            On Error GoTo 0
+                            
+                            batchSQL = ""
+                            batchCount = 0
+                            ReDim arrInserts(1 To 1)
+                            idx = 0
+                            Application.StatusBar = "Subiendo registros... " & registrosSubidos & " (Mes " & mes & ")"
+                        End If
+                    End If ' <<< fin de validación horas > 0
+                End If
+            Next i
+
+            ' ejecutar lote restante
+            If batchCount > 0 Then
+                On Error Resume Next
+                conn.Execute batchSQL
+                If Err.Number <> 0 Then
+                    Err.Clear
+                    Call EscribirSentenciaFallidaPorElementos(conn, arrInserts, ws, c)
+                    conn.Close
+                    Set conn = Nothing
+                    Exit Sub
+                End If
+                On Error GoTo 0
+            End If
+        End If
+    Next c
+End Sub
+
+
+' ============================================================
+' SUBRUTINA AUXILIAR PARA ERRORES
+' ============================================================
+Private Sub EscribirSentenciaFallidaPorElementos(conn As Object, insertsArr As Variant, ws As Worksheet, colIndex As Long)
+    Dim j As Long
+    Dim s As String
+    Dim colLetter As String
+    colLetter = Split(Cells(1, colIndex).Address, "$")(1)
+    
+    For j = LBound(insertsArr) To UBound(insertsArr)
+        On Error Resume Next
+        conn.Execute insertsArr(j)
+        If Err.Number <> 0 Then
+            s = "Error Nº: " & Err.Number & " - " & Err.Description & vbCrLf & vbCrLf & _
+                "Columna origen: " & colLetter & " (colIndex=" & colIndex & ")" & vbCrLf & _
+                "Sentencia fallida:" & vbCrLf & insertsArr(j)
+            ws.Range("A84").value = s
+            MsgBox "Se detectó una sentencia que no pudo insertarse. La consulta se copió en la celda A84 para su revisión.", vbExclamation
+            Err.Clear
+            On Error GoTo 0
+            Exit Sub
+        End If
+        On Error GoTo 0
+    Next j
+    
+    ws.Range("A84").value = "Batch falló pero no se logró aislar la sentencia individual. Revisar tipos en columna: " & colLetter
+    MsgBox "Batch falló pero no se pudo identificar la sentencia exacta. Se dejó nota en A84.", vbExclamation
+End Sub
+
+
+Sub Subir_Datos_Entrada_PlanTCI()
+
+    On Error GoTo ManejoErroresGlobal
+    
+    Dim conn As Object
+    Dim connStr As String
+    Dim ws As Worksheet
+    Dim lastRow As Long
+    Dim i As Long, c As Long
+    Dim batchSQL As String
+    Dim batchSize As Long, batchCount As Long
+    Dim dni As String, nombre As String
+    Dim horas As Double
+    Dim centroCosto As String, concepto As String
+    Dim registrosSubidos As Long
+    Dim sqlSingle As String
+    Dim hojaOrigen As String
+    Dim origen As String
+    Dim mes As Integer
+    
+    ' === CONFIGURACIÓN ===
+    Set ws = ThisWorkbook.Sheets("1. Plan TC-I")
+    hojaOrigen = "1. Plan TC-I"
+    origen = ws.Range("A2").value
+    mes = 3
+    batchSize = 200
+    registrosSubidos = 0
+    
+    ' Cadena de conexión
+    connStr = "Provider=SQLOLEDB;Data Source=ucsp.database.windows.net;" & _
+              "Initial Catalog=saldos;User ID=robert;Password=)358£CvM,4'l;"
+    
+    ' Conexión
+    Set conn = CreateObject("ADODB.Connection")
+    conn.Open connStr
+    
+    ' === BORRAR DATOS EXISTENTES ===
+    Dim sqlDelete As String
+    sqlDelete = "DELETE FROM DATOS_ENTRADA WHERE HOJA_ORIGEN='" & hojaOrigen & "' AND ORIGEN='" & Replace(origen, "'", "''") & "'"
+    conn.Execute sqlDelete
+    
+    ' === OBTENER LÍMITES ===
+    lastRow = ws.Cells(ws.Rows.Count, "A").End(xlUp).Row
+    
+    ' Limpiar A84 antes de empezar
+    ws.Range("A84").ClearContents
+    
+    ' === RECORRER COLUMNAS G (7) a W (23) ===
+    For c = 7 To 23
+        ' ?? Ajuste: centro de costo en fila 5, concepto en fila 6
+        centroCosto = Trim(ws.Cells(5, c).value)
+        concepto = Trim(ws.Cells(6, c).value)
+        
+        If centroCosto <> "" And concepto <> "" Then
+            
+            batchSQL = ""
+            batchCount = 0
+            
+            ' ?? Ajuste: comenzar desde la fila 7
+            For i = 7 To lastRow
+                dni = Trim(ws.Cells(i, "A").value)
+                nombre = Replace(Trim(ws.Cells(i, "B").value), "'", "''")
+                
+                If dni <> "" Then
+                    ' convertir horas a decimal
+                    If IsEmpty(ws.Cells(i, c).value) Or ws.Cells(i, c).value = "" Then
+                        horas = 0
+                    Else
+                        horas = Round(CDbl(ws.Cells(i, c).value) * 24, 2)
+                    End If
+                    
+                    ' Solo subir si horas > 0
+                    If horas > 0 Then
+                        sqlSingle = "('" & Replace(dni, "'", "''") & "', '" & nombre & "', '" & _
+                                    Replace(centroCosto, "'", "''") & "', '" & Replace(concepto, "'", "''") & "', " & _
+                                    Replace(CStr(horas), ",", ".") & ", 0, '" & hojaOrigen & "', '" & Replace(origen, "'", "''") & "', " & mes & ")"
+                        
+                        If batchCount = 0 Then
+                            batchSQL = "INSERT INTO DATOS_ENTRADA (DNI, NOMBRE, CENTRO_COSTO, CONCEPTO, HORAS, IMPORTE, HOJA_ORIGEN, ORIGEN, MES) VALUES " & sqlSingle
+                        Else
+                            batchSQL = batchSQL & ", " & sqlSingle
+                        End If
+                        
+                        batchCount = batchCount + 1
+                        registrosSubidos = registrosSubidos + 1
+                        
+                        ' Ejecutar por lote
+                        If batchCount = batchSize Then
+                            conn.Execute batchSQL
+                            batchSQL = ""
+                            batchCount = 0
+                            Application.StatusBar = "Subiendo registros... " & registrosSubidos
+                        End If
+                    End If
+                End If
+            Next i
+            
+            ' Ejecutar lote restante
+            If batchCount > 0 Then
+                conn.Execute batchSQL
+            End If
+        End If
+    Next c
+    
+    ' Cerrar conexión
+    conn.Close
+    Set conn = Nothing
+    Application.StatusBar = False
+    MsgBox "Datos subidos correctamente. Total registros procesados: " & registrosSubidos, vbInformation
+    Exit Sub
+
+ManejoErroresGlobal:
+    Application.StatusBar = False
+    If Not conn Is Nothing Then
+        If conn.State = 1 Then conn.Close
+    End If
+    Set conn = Nothing
+    MsgBox "Error inesperado: " & Err.Description, vbCritical
+
+End Sub
+
+Sub Subir_Datos_Entrada_PlanTCII()
+
+    On Error GoTo ManejoErroresGlobal
+    
+    Dim conn As Object
+    Dim connStr As String
+    Dim ws As Worksheet
+    Dim lastRow As Long
+    Dim i As Long, c As Long
+    Dim batchSQL As String
+    Dim batchSize As Long, batchCount As Long
+    Dim dni As String, nombre As String
+    Dim horas As Double
+    Dim centroCosto As String, concepto As String
+    Dim registrosSubidos As Long
+    Dim sqlSingle As String
+    Dim hojaOrigen As String
+    Dim origen As String
+    Dim mes As Integer
+    Dim sqlProc As String
+    
+    ' === CONFIGURACIÓN ===
+    Set ws = ThisWorkbook.Sheets("Plan TC-II")
+    hojaOrigen = "Plan TC-II"
+    origen = ws.Range("A2").value
+    mes = 8
+    batchSize = 200
+    registrosSubidos = 0
+    
+    ' Cadena de conexión
+    connStr = "Provider=SQLOLEDB;Data Source=ucsp.database.windows.net;" & _
+              "Initial Catalog=saldos;User ID=robert;Password=)358£CvM,4'l;"
+    
+    ' Conexión
+    Set conn = CreateObject("ADODB.Connection")
+    conn.ConnectionTimeout = 300
+    conn.CommandTimeout = 300
+    conn.Open connStr
+    
+    ' === BORRAR DATOS EXISTENTES ===
+    Dim sqlDelete As String
+    sqlDelete = "DELETE FROM DATOS_ENTRADA WHERE HOJA_ORIGEN='" & hojaOrigen & _
+                "' AND ORIGEN='" & Replace(origen, "'", "''") & "'"
+    conn.Execute sqlDelete
+    
+    ' === OBTENER LÍMITES ===
+    lastRow = ws.Cells(ws.Rows.Count, "A").End(xlUp).Row
+    
+    ' Limpiar A84 antes de empezar
+    ws.Range("A84").ClearContents
+    
+    ' === RECORRER COLUMNAS G (7) a W (23) ===
+    For c = 7 To 23
+        centroCosto = Trim(ws.Cells(5, c).value)
+        concepto = Trim(ws.Cells(6, c).value)
+        
+        If centroCosto <> "" And concepto <> "" Then
+            
+            batchSQL = ""
+            batchCount = 0
+            
+            For i = 7 To lastRow
+                dni = Trim(ws.Cells(i, "A").value)
+                nombre = Replace(Trim(ws.Cells(i, "B").value), "'", "''")
+                
+                If dni <> "" Then
+                    ' convertir horas a decimal
+                    If IsEmpty(ws.Cells(i, c).value) Or ws.Cells(i, c).value = "" Then
+                        horas = 0
+                    Else
+                        horas = Round(CDbl(ws.Cells(i, c).value) * 24, 2)
+                    End If
+                    
+                    ' Solo subir si horas > 0
+                    If horas > 0 Then
+                        sqlSingle = "('" & Replace(dni, "'", "''") & "', '" & nombre & "', '" & _
+                                    Replace(centroCosto, "'", "''") & "', '" & Replace(concepto, "'", "''") & "', " & _
+                                    Replace(CStr(horas), ",", ".") & ", 0, '" & hojaOrigen & "', '" & Replace(origen, "'", "''") & "', " & mes & ")"
+                        
+                        If batchCount = 0 Then
+                            batchSQL = "INSERT INTO DATOS_ENTRADA (DNI, NOMBRE, CENTRO_COSTO, CONCEPTO, HORAS, IMPORTE, HOJA_ORIGEN, ORIGEN, MES) VALUES " & sqlSingle
+                        Else
+                            batchSQL = batchSQL & ", " & sqlSingle
+                        End If
+                        
+                        batchCount = batchCount + 1
+                        registrosSubidos = registrosSubidos + 1
+                        
+                        ' Ejecutar por lote
+                        If batchCount = batchSize Then
+                            conn.Execute batchSQL
+                            batchSQL = ""
+                            batchCount = 0
+                            Application.StatusBar = "Subiendo registros... " & registrosSubidos
+                        End If
+                    End If
+                End If
+            Next i
+            
+            ' Ejecutar lote restante
+            If batchCount > 0 Then
+                conn.Execute batchSQL
+            End If
+        End If
+    Next c
+
+    ' === EJECUTAR LOS PROCEDIMIENTOS SQL ===
+    sqlProc = "EXEC sp_ValorizarPlanilla_Total_2026 @OrigenEntrada='" & Replace(origen, "'", "''") & "';" & vbCrLf & _
+              "EXEC sp_Valorizar_CargaAcademica_2026;"
+    conn.Execute sqlProc
+
+    ' === FINALIZAR ===
+    conn.Close
+    Set conn = Nothing
+    Application.StatusBar = False
+    MsgBox "Datos subidos y procedimientos ejecutados correctamente desde '" & hojaOrigen & "'. Total registros procesados: " & registrosSubidos, vbInformation
+    Exit Sub
+
+ManejoErroresGlobal:
+    Application.StatusBar = False
+    If Not conn Is Nothing Then
+        If conn.State = 1 Then conn.Close
+    End If
+    Set conn = Nothing
+    MsgBox "Error inesperado: " & Err.Description, vbCritical
+
+End Sub
+
+Sub Subir_Horas_Adicionales_Extendido()
+
+    On Error GoTo ManejoErrores
+
+    Dim conn As Object
+    Dim connStr As String
+    Dim ws As Worksheet
+    Dim mesCol As Variant
+    Dim tipoCol As Variant
+    Dim horasVal As Variant
+    Dim tarifaVal As Variant
+    Dim sql As String
+    Dim origen As String
+    Dim HOJA_ORIGEN As String
+    Dim mesNum As Integer
+    Dim j As Integer
+    Dim fila As Long
+    Dim contador As Long
+    Dim concepto As String, concepto2 As String
+    Dim centroCosto As String
+    Dim rangoBloques As Variant
+    Dim r As Variant
+    Dim sqlProc As String
+
+    ' === CONFIGURACIÓN ===
+    Set ws = ThisWorkbook.Sheets("Horas Adicionales")
+    origen = ws.Range("A1").value        ' Toma el ORIGEN desde A1
+    HOJA_ORIGEN = "Horas Adicionales"
+    
+    ' === CONEXIÓN SQL ===
+    connStr = "Provider=SQLOLEDB;Data Source=ucsp.database.windows.net;" & _
+              "Initial Catalog=saldos;User ID=robert;Password=)358£CvM,4'l;"
+    Set conn = CreateObject("ADODB.Connection")
+    conn.ConnectionTimeout = 300
+    conn.CommandTimeout = 300
+    conn.Open connStr
+    
+    ' === BORRAR DATOS EXISTENTES ===
+    sql = "DELETE FROM DATOS_ENTRADA WHERE ORIGEN='" & Replace(origen, "'", "''") & _
+          "' AND HOJA_ORIGEN='" & HOJA_ORIGEN & "'"
+    conn.Execute sql
+    
+    contador = 0
+    
+    ' === RECORRER MESES 1 A 12 ===
+    For mesNum = 1 To 12
+        mesCol = ws.Cells(2, 4 + (mesNum - 1) * 3).value
+        
+        For j = 0 To 2 ' tres columnas por mes
+            tipoCol = ws.Cells(3, 4 + (mesNum - 1) * 3 + j).value
+            
+            ' === BLOQUES ORIGINALES ===
+            For fila = 10 To 51 Step 5
+                concepto = ws.Cells(fila - 2, "A").value
+                concepto2 = ws.Cells(fila, "A").value
+                centroCosto = ws.Cells(fila, "B").value
+                tarifaVal = ws.Cells(fila, "C").value
+                horasVal = ws.Cells(fila, 4 + (mesNum - 1) * 3 + j).value
+                
+                If IsNumeric(horasVal) And horasVal > 0 Then
+                    InsertarDato conn, HOJA_ORIGEN, origen, CStr(mesCol), CStr(tipoCol), concepto, concepto2, centroCosto, tarifaVal, horasVal, contador
+                End If
+                
+                concepto2 = ws.Cells(fila + 1, "A").value
+                centroCosto = ws.Cells(fila + 1, "B").value
+                tarifaVal = ws.Cells(fila + 1, "C").value
+                horasVal = ws.Cells(fila + 1, 4 + (mesNum - 1) * 3 + j).value
+                
+                If IsNumeric(horasVal) And horasVal > 0 Then
+                    InsertarDato conn, HOJA_ORIGEN, origen, CStr(mesCol), CStr(tipoCol), concepto, concepto2, centroCosto, tarifaVal, horasVal, contador
+                End If
+            Next fila
+            
+            ' === BLOQUES NUEVOS ===
+            rangoBloques = Array( _
+                Array(56, 58, 59), _
+                Array(61, 63, 64), _
+                Array(66, 68, 73), _
+                Array(75, 77, 82), _
+                Array(86, 88, 93), _
+                Array(95, 97, 102), _
+                Array(104, 106, 110), _
+                Array(115, 117, 117), _
+                Array(119, 121, 121))
+            
+            For Each r In rangoBloques
+                concepto = ws.Cells(r(0), "A").value
+                For fila = r(1) To r(2)
+                    concepto2 = ws.Cells(fila, "A").value
+                    centroCosto = ws.Cells(fila, "B").value
+                    tarifaVal = ws.Cells(fila, "C").value
+                    horasVal = ws.Cells(fila, 4 + (mesNum - 1) * 3 + j).value
+                    
+                    If IsNumeric(horasVal) And horasVal > 0 Then
+                        InsertarDato conn, HOJA_ORIGEN, origen, CStr(mesCol), CStr(tipoCol), concepto, concepto2, centroCosto, tarifaVal, horasVal, contador
+                    End If
+                Next fila
+            Next r
+        Next j
+    Next mesNum
+    
+    MsgBox "Carga completada: " & contador & " registros subidos correctamente a la tabla DATOS_ENTRADA.", vbInformation
+
+    ' === EJECUTAR PROCEDIMIENTO SQL ===
+    sqlProc = "EXEC sp_Valorizar_HorasAdicionales_2026 @OrigenEntrada='" & Replace(origen, "'", "''") & "'"
+    conn.Execute sqlProc
+
+    MsgBox "Procedimiento 'sp_Valorizar_HorasAdicionales_2026' ejecutado correctamente para el origen: " & origen, vbInformation
+
+    conn.Close
+    Set conn = Nothing
+    Exit Sub
+
+ManejoErrores:
+    MsgBox "Error inesperado: " & Err.Description, vbCritical
+    If Not conn Is Nothing Then
+        If conn.State = 1 Then conn.Close
+    End If
+    Set conn = Nothing
+
+End Sub
+
+
+' ==== FUNCIÓN AUXILIAR ====
+Private Sub InsertarDato(conn As Object, hoja As String, origen As String, mes As String, _
+                         tipo As String, concepto As String, concepto2 As String, _
+                         centro As String, tarifa As Variant, horas As Variant, ByRef contador As Long)
+    Dim sql As String
+    sql = "INSERT INTO DATOS_ENTRADA (HOJA_ORIGEN, ORIGEN, MES, TIPO, CONCEPTO, CONCEPTO_2, CENTRO_COSTO, TARIFA, HORAS) VALUES (" & _
+          "'" & hoja & "'," & _
+          "'" & Replace(origen, "'", "''") & "'," & _
+          "'" & mes & "'," & _
+          "'" & Replace(tipo, "'", "''") & "'," & _
+          "'" & Replace(concepto, "'", "''") & "'," & _
+          "'" & Replace(concepto2, "'", "''") & "'," & _
+          "'" & Replace(centro, "'", "''") & "',"
+    
+    If IsNumeric(tarifa) And tarifa <> "" Then
+        sql = sql & Replace(tarifa, ",", ".") & ","
+    Else
+        sql = sql & "NULL,"
+    End If
+    
+    sql = sql & Replace(horas, ",", ".") & ")"
+    
+    conn.Execute sql
+    contador = contador + 1
+End Sub
+
+Sub SubirDatos_Postgrado()
+    On Error GoTo ManejoErrores
+    Dim conn As Object
+    Dim connStr As String
+    Dim ws As Worksheet
+    Dim hojaOrigen As String
+    Dim concepto As String
+    Dim concepto2 As String
+    Dim centroCosto As String
+    Dim tipo As String
+    Dim mes As String
+    Dim importe As Variant
+    Dim fila As Long, col As Long
+    Dim sql As String
+    Dim origen As String
+    Dim mesArray1 As Variant, mesArray2 As Variant
+    Dim idx As Integer
+    Dim errorRow As Long
+    Dim sqlProc As String
+
+    ' --- Configuración inicial ---
+    Set ws = ThisWorkbook.Sheets("Postgrado")
+    hojaOrigen = "Postgrado"
+    concepto = ws.Range("A5").value
+    origen = ws.Range("A1").value
+    errorRow = 84
+
+    ' --- Meses fijos por bloque ---
+    mesArray1 = Array(1, 2, 3, 4, 5, 6, 7)
+    mesArray2 = Array(8, 9, 10, 11, 12)
+
+    ' --- Conexión SQL ---
+    Set conn = CreateObject("ADODB.Connection")
+    connStr = "Provider=SQLOLEDB;Data Source=ucsp.database.windows.net;" & _
+              "Initial Catalog=saldos;User ID=robert;Password=)358£CvM,4'l;"
+    conn.ConnectionTimeout = 300
+    conn.CommandTimeout = 300
+    conn.Open connStr
+
+    ' --- Borrar datos previos ---
+    conn.Execute "DELETE FROM DATOS_ENTRADA WHERE HOJA_ORIGEN = '" & hojaOrigen & _
+                 "' AND ORIGEN = '" & Replace(origen, "'", "''") & "'"
+
+    ' === BLOQUE 1: D–Q ===
+    Dim colsBloque1a As Variant, colsBloque1b As Variant
+    colsBloque1a = Array(4, 6, 8, 10, 12, 14, 16)   ' D,F,H,J,L,N,P
+    colsBloque1b = Array(5, 7, 9, 11, 13, 15, 17)   ' E,G,I,K,M,O,Q
+
+    For fila = 7 To 22
+        concepto2 = ws.Cells(fila, "A").value
+        centroCosto = ws.Cells(fila, "B").value
+        If centroCosto <> "" Then
+            For idx = 0 To UBound(colsBloque1a)
+                mes = mesArray1(idx)
+
+                ' --- columnas D,F,H,J,L,N,P ---
+                tipo = ws.Cells(4, colsBloque1a(idx)).value
+                importe = ws.Cells(fila, colsBloque1a(idx)).value
+                Call InsertarDato_Postgrado(conn, ws, hojaOrigen, origen, concepto, concepto2, centroCosto, tipo, CStr(mes), importe, errorRow)
+
+
+                ' --- columnas E,G,I,K,M,O,Q ---
+                tipo = ws.Cells(4, colsBloque1b(idx)).value
+                importe = ws.Cells(fila, colsBloque1b(idx)).value
+                Call InsertarDato_Postgrado(conn, ws, hojaOrigen, origen, concepto, concepto2, centroCosto, tipo, CStr(mes), importe, errorRow)
+
+            Next idx
+        End If
+    Next fila
+
+    ' === BLOQUE 2: T–AC ===
+    Dim colsBloque2a As Variant, colsBloque2b As Variant
+    colsBloque2a = Array(20, 22, 24, 26, 28)   ' T,V,X,Z,AB
+    colsBloque2b = Array(21, 23, 25, 27, 29)   ' U,W,Y,AA,AC
+
+    For fila = 7 To 22
+        concepto2 = ws.Cells(fila, "A").value
+        centroCosto = ws.Cells(fila, "B").value
+        If centroCosto <> "" Then
+            For idx = 0 To UBound(colsBloque2a)
+                mes = mesArray2(idx)
+
+                ' --- columnas T,V,X,Z,AB ---
+                tipo = ws.Cells(4, colsBloque2a(idx)).value
+                importe = ws.Cells(fila, colsBloque2a(idx)).value
+                Call InsertarDato_Postgrado(conn, ws, hojaOrigen, origen, concepto, concepto2, centroCosto, tipo, CStr(mes), importe, errorRow)
+
+                ' --- columnas U,W,Y,AA,AC ---
+                tipo = ws.Cells(4, colsBloque2b(idx)).value
+                importe = ws.Cells(fila, colsBloque2b(idx)).value
+                Call InsertarDato_Postgrado(conn, ws, hojaOrigen, origen, concepto, concepto2, centroCosto, tipo, mes, importe, errorRow)
+
+            Next idx
+        End If
+    Next fila
+
+    MsgBox "Datos cargados correctamente para HOJA_ORIGEN = '" & hojaOrigen & "' y ORIGEN = '" & origen & "'.", vbInformation
+
+    ' === EJECUTAR PROCEDIMIENTO SQL ===
+    sqlProc = "EXEC sp_Valorizar_Postgrado_2026 @OrigenEntrada='" & Replace(origen, "'", "''") & "'"
+    conn.Execute sqlProc
+
+
+
+Salida:
+    On Error Resume Next
+    If Not conn Is Nothing Then conn.Close
+    Set conn = Nothing
+    Exit Sub
+
+ManejoErrores:
+    MsgBox "Error en la macro: " & Err.Description, vbCritical
+    Resume Salida
+End Sub
+
+
+' =========================================================
+' Procedimiento auxiliar: inserta cada registro individual
+' =========================================================
+
+' =========================================================
+Private Sub InsertarDato_Postgrado(conn As Object, ws As Worksheet, hojaOrigen As String, origen As String, _
+    concepto As String, concepto2 As String, centroCosto As String, tipo As String, mes As Variant, _
+    importe As Variant, ByRef errorRow As Long)
+
+    Dim sql As String
+
+    If Not IsEmpty(importe) And IsNumeric(importe) Then
+        On Error Resume Next
+        sql = "INSERT INTO DATOS_ENTRADA (HOJA_ORIGEN, ORIGEN, CONCEPTO, CONCEPTO_2, CENTRO_COSTO, TIPO, MES, IMPORTE) " & _
+              "VALUES ('" & hojaOrigen & "', '" & Replace(origen, "'", "''") & "', '" & Replace(concepto, "'", "''") & "', " & _
+              "'" & Replace(concepto2, "'", "''") & "', '" & Replace(centroCosto, "'", "''") & "', '" & Replace(tipo, "'", "''") & "', " & _
+              "'" & mes & "', " & Replace(importe, ",", ".") & ")"
+        conn.Execute sql
+
+        If Err.Number <> 0 Then
+            ws.Cells(errorRow, 1).value = sql
+            errorRow = errorRow + 1
+            Err.Clear
+        End If
+        On Error GoTo 0
+    End If
+End Sub
+
+Sub CargarDatos_Investigacion()
+
+    Dim ws As Worksheet
+    Set ws = ThisWorkbook.Sheets("Investigacion")
+    
+    Dim conn As Object
+    Dim connStr As String
+    Dim sql As String
+    Dim hojaOrigen As String
+    Dim origen As String
+    Dim contador As Long
+    contador = 0
+    
+    hojaOrigen = "Investigacion"
+    origen = ws.Range("A1").value   ' ?? ORIGEN toma el valor de A1
+    
+    ' === CONEXIÓN SQL ===
+    connStr = "Provider=SQLOLEDB;Data Source=ucsp.database.windows.net;" & _
+              "Initial Catalog=saldos;User ID=robert;Password=)358£CvM,4'l;"
+              
+    Set conn = CreateObject("ADODB.Connection")
+    conn.Open connStr
+    
+    ' === BORRAR DATOS EXISTENTES ===
+    sql = "DELETE FROM DATOS_ENTRADA WHERE HOJA_ORIGEN = '" & hojaOrigen & "' " & _
+          "AND ORIGEN = '" & Replace(origen, "'", "''") & "'"
+    conn.Execute sql
+    
+    Dim concepto As String, concepto2 As String, centro As String
+    Dim mes As String, importe As Variant
+    Dim i As Long, j As Long
+    
+    ' --- DEFINICIÓN DE BLOQUES ---
+    Dim bloques
+    bloques = Array( _
+        Array("A4", "A8:A21", "B8:B21", "D8:J21", "D6:J6"), _
+        Array("A4", "A8:A21", "B8:B21", "L8:P21", "L6:P6"), _
+        Array("A63", "A67:A80", "B67:B80", "D67:J80", "D6:J6"), _
+        Array("A63", "A67:A80", "B67:B80", "L67:P80", "L6:P6"), _
+        Array("A123", "A127:A140", "B127:B140", "D127:J140", "D6:J6"), _
+        Array("A123", "A127:A140", "B127:B140", "L127:P140", "L6:P6"), _
+        Array("A183", "A187:A200", "B187:B200", "D187:J200", "D6:J6"), _
+        Array("A183", "A187:A200", "B187:B200", "L187:P200", "L6:P6") _
+    )
+    
+    ' --- RECORRER BLOQUES ---
+    Dim b As Variant
+    For Each b In bloques
+        Dim rngConcepto2 As Range, rngCentro As Range, rngImporte As Range, rngMes As Range
+        concepto = ws.Range(b(0)).value
+        Set rngConcepto2 = ws.Range(b(1))
+        Set rngCentro = ws.Range(b(2))
+        Set rngImporte = ws.Range(b(3))
+        Set rngMes = ws.Range(b(4))
+        
+        ' --- RECORRER FILAS (CONCEPTO_2 / CENTRO_COSTO) ---
+        For i = 1 To rngConcepto2.Rows.Count
+            concepto2 = rngConcepto2.Cells(i, 1).value
+            centro = rngCentro.Cells(i, 1).value
+            
+            ' --- RECORRER COLUMNAS DE IMPORTE (MESES) ---
+            For j = 1 To rngImporte.Columns.Count
+                mes = rngMes.Cells(1, j).value
+                importe = rngImporte.Cells(i, j).value
+                
+                If IsNumeric(importe) And importe <> 0 Then
+                    sql = "INSERT INTO DATOS_ENTRADA (HOJA_ORIGEN, ORIGEN, CONCEPTO, CONCEPTO_2, CENTRO_COSTO, MES, IMPORTE) VALUES (" & _
+                          "'" & hojaOrigen & "', " & _
+                          "'" & Replace(origen, "'", "''") & "', " & _
+                          "'" & Replace(concepto, "'", "''") & "', " & _
+                          "'" & Replace(concepto2, "'", "''") & "', " & _
+                          "'" & Replace(centro, "'", "''") & "', " & _
+                          "'" & Replace(mes, "'", "''") & "', " & _
+                          Replace(importe, ",", ".") & ")"
+                    
+                    On Error Resume Next
+                    conn.Execute sql
+                    If Err.Number = 0 Then
+                        contador = contador + 1
+                    Else
+                        Debug.Print "Error en fila " & rngConcepto2.Cells(i, 1).Row & ": " & Err.Description
+                        Err.Clear
+                    End If
+                    On Error GoTo 0
+                End If
+            Next j
+        Next i
+    Next b
+    
+    ' === EJECUTAR PROCEDIMIENTO SQL ===
+    sql = "EXEC sp_Valorizar_Investigacion_2026 @OrigenEntrada = '" & Replace(origen, "'", "''") & "'"
+    conn.Execute sql
+    
+    ' --- CIERRE DE CONEXIÓN ---
+    conn.Close
+    Set conn = Nothing
+    
+    MsgBox "Carga completada: " & contador & " registros subidos correctamente a DATOS_ENTRADA." & vbCrLf & _
+           "Procedimiento sp_Valorizar_Investigacion_2026 ejecutado con éxito.", vbInformation
+
+End Sub
+
+Sub CargarDatos_Ayudantias()
+
+    Dim ws As Worksheet
+    Set ws = ThisWorkbook.Sheets("Ayudantias")
+    
+    Dim conn As Object
+    Dim connStr As String
+    Dim sql As String
+    Dim hojaOrigen As String
+    Dim origen As String
+    hojaOrigen = "Ayudantias"
+    origen = ws.Range("A1").value
+    
+    ' === CONEXIÓN SQL ===
+    connStr = "Provider=SQLOLEDB;Data Source=ucsp.database.windows.net;" & _
+              "Initial Catalog=saldos;User ID=robert;Password=)358£CvM,4'l;"
+              
+    Set conn = CreateObject("ADODB.Connection")
+    conn.Open connStr
+    
+    ' === BORRAR DATOS EXISTENTES DE ESA HOJA Y ORIGEN ===
+    sql = "DELETE FROM DATOS_ENTRADA WHERE HOJA_ORIGEN = '" & hojaOrigen & "' AND ORIGEN = '" & origen & "'"
+    conn.Execute sql
+    
+    Dim concepto As String, concepto2 As String
+    Dim centro As String, tipo As String
+    Dim mes As String, horas As Variant
+    Dim i As Long, j As Long
+    Dim contador As Long
+    contador = 0
+    
+    concepto = ws.Range("A3").value
+    
+    ' === DEFINIR BLOQUES ===
+    Dim colHoras1, colMeses1, colHoras2, colMeses2
+    colHoras1 = Array("F", "H", "J", "L", "N", "P", "R")
+    colMeses1 = Array("E5", "G5", "I5", "K5", "M5", "O5", "Q5")
+    colHoras2 = Array("U", "W", "Y", "AA", "AC")
+    colMeses2 = Array("T5", "V5", "X5", "Z5", "AB5")
+    
+    ' === PROCESAR BLOQUE 1 ===
+    For j = LBound(colHoras1) To UBound(colHoras1)
+        mes = ws.Range(colMeses1(j)).value
+        
+        For i = 7 To 23
+            concepto2 = ws.Range("A" & i).value
+            centro = ws.Range("B" & i).value
+            tipo = ws.Range("C" & i).value
+            horas = ws.Range(colHoras1(j) & i).value
+            
+            If IsNumeric(horas) And horas <> 0 Then
+                sql = "INSERT INTO DATOS_ENTRADA (HOJA_ORIGEN, ORIGEN, CONCEPTO, CONCEPTO_2, CENTRO_COSTO, TIPO, MES, IMPORTE) VALUES (" & _
+                      "'" & hojaOrigen & "', " & _
+                      "'" & Replace(origen, "'", "''") & "', " & _
+                      "'" & Replace(concepto, "'", "''") & "', " & _
+                      "'" & Replace(concepto2, "'", "''") & "', " & _
+                      "'" & Replace(centro, "'", "''") & "', " & _
+                      "'" & Replace(tipo, "'", "''") & "', " & _
+                      "'" & Replace(mes, "'", "''") & "', " & _
+                      Replace(horas, ",", ".") & ")"
+                
+                On Error Resume Next
+                conn.Execute sql
+                If Err.Number = 0 Then contador = contador + 1
+                On Error GoTo 0
+            End If
+        Next i
+    Next j
+    
+    ' === PROCESAR BLOQUE 2 ===
+    For j = LBound(colHoras2) To UBound(colHoras2)
+        mes = ws.Range(colMeses2(j)).value
+        
+        For i = 7 To 23
+            concepto2 = ws.Range("A" & i).value
+            centro = ws.Range("B" & i).value
+            tipo = ws.Range("C" & i).value
+            horas = ws.Range(colHoras2(j) & i).value
+            
+            If IsNumeric(horas) And horas <> 0 Then
+                sql = "INSERT INTO DATOS_ENTRADA (HOJA_ORIGEN, ORIGEN, CONCEPTO, CONCEPTO_2, CENTRO_COSTO, TIPO, MES, IMPORTE) VALUES (" & _
+                      "'" & hojaOrigen & "', " & _
+                      "'" & Replace(origen, "'", "''") & "', " & _
+                      "'" & Replace(concepto, "'", "''") & "', " & _
+                      "'" & Replace(concepto2, "'", "''") & "', " & _
+                      "'" & Replace(centro, "'", "''") & "', " & _
+                      "'" & Replace(tipo, "'", "''") & "', " & _
+                      "'" & Replace(mes, "'", "''") & "', " & _
+                      Replace(horas, ",", ".") & ")"
+                
+                On Error Resume Next
+                conn.Execute sql
+                If Err.Number = 0 Then contador = contador + 1
+                On Error GoTo 0
+            End If
+        Next i
+    Next j
+    
+    ' === EJECUTAR PROCEDIMIENTO DE VALORIZACIÓN ===
+    sql = "EXEC sp_Valorizar_Ayudantias_2026 @OrigenEntrada = '" & Replace(origen, "'", "''") & "'"
+    conn.Execute sql
+    
+    ' === CIERRE DE CONEXIÓN ===
+    conn.Close
+    Set conn = Nothing
+    
+    MsgBox "Carga completada: " & contador & " registros subidos correctamente desde Ayudantías (" & origen & ")." & vbCrLf & _
+           "Procedimiento sp_Valorizar_Ayudantias_2026 ejecutado exitosamente.", vbInformation
 
 End Sub
